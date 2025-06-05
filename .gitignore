@@ -59,6 +59,27 @@ rag_storage/
 knowledge*.pdf
 knowledge_compressed*.pdf
 
+# Image handling
+# Ignore all images by default
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+*.webp
+*.svg
+*.ico
+# But track specific images in the images directory
+!images/
+!images/*.jpg
+!images/*.jpeg
+!images/*.png
+!images/*.gif
+!images/*.bmp
+!images/*.webp
+!images/*.svg
+!images/*.ico
+
 # IDE and editor files
 *.sublime-project
 *.sublime-workspace

@@ -1,10 +1,14 @@
 import os
 import re
-from typing import List
-from fastapi import FastAPI, UploadFile, Form
+from typing import List, Dict, Optional
+from fastapi import FastAPI, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from PyPDF2 import PdfReader
 from pydantic import BaseModel
+import torch
+from PIL import Image
+import open_clip
 from sentence_transformers import SentenceTransformer
 import openai
 import pinecone
@@ -12,6 +16,9 @@ from langdetect import detect
 from dotenv import load_dotenv
 from pinecone import Pinecone, ServerlessSpec
 import numpy as np
+import json
+from pathlib import Path
+import google.generativeai as genai
 load_dotenv()
 import nltk
 from nltk.tokenize import sent_tokenize
@@ -19,6 +26,130 @@ from sklearn.metrics.pairwise import cosine_similarity
 
 # nltk.download('punkt')  #
 openai.api_key = os.getenv("OPENAI_API_KEY")
+
+# Initialize Gemini
+genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+model = genai.GenerativeModel('gemini-2.0-flash-001')
+
+# Image handling
+IMAGES_DIR = Path("images")
+IMAGES_METADATA_FILE = IMAGES_DIR / "metadata.json"
+
+# Initialize CLIP
+device = "cuda" if torch.cuda.is_available() else "cpu"
+clip_model, _, preprocess = open_clip.create_model_and_transforms('ViT-B-32', pretrained='openai')
+clip_model = clip_model.to(device)
+
+class ImageMetadata(BaseModel):
+    id: str
+    filename: str
+    embedding: Optional[List[float]] = None  # Store CLIP embedding
+
+class ImageStore:
+    def __init__(self):
+        self.images_dir = IMAGES_DIR
+        self.metadata_file = IMAGES_METADATA_FILE
+        self.images_dir.mkdir(exist_ok=True)
+        self.metadata: Dict[str, ImageMetadata] = self._load_metadata()
+        # Precompute embeddings for all images
+        self._precompute_embeddings()
+
+    def _load_metadata(self) -> Dict[str, ImageMetadata]:
+        if self.metadata_file.exists():
+            with open(self.metadata_file, 'r') as f:
+                data = json.load(f)
+                return {k: ImageMetadata(**v) for k, v in data.items()}
+        return {}
+
+    def _save_metadata(self):
+        with open(self.metadata_file, 'w') as f:
+            json.dump({k: v.dict() for k, v in self.metadata.items()}, f, indent=2)
+
+    def _precompute_embeddings(self):
+        """Precompute CLIP embeddings for all images"""
+        for image_id, metadata in self.metadata.items():
+            if metadata.embedding is None:
+                image_path = self.images_dir / metadata.filename
+                if image_path.exists():
+                    try:
+                        image = preprocess(Image.open(image_path)).unsqueeze(0).to(device)
+                        with torch.no_grad():
+                            image_features = clip_model.encode_image(image)
+                            metadata.embedding = image_features.cpu().numpy().tolist()[0]
+                    except Exception as e:
+                        print(f"Error computing embedding for {image_id}: {e}")
+        self._save_metadata()
+
+    def add_image(self, file: UploadFile, metadata: ImageMetadata):
+        if len(self.metadata) >= 6:
+            raise HTTPException(status_code=400, detail="Maximum of 6 images allowed")
+        
+        # Save image file
+        file_path = self.images_dir / file.filename
+        with open(file_path, "wb") as f:
+            f.write(file.file.read())
+        
+        # Compute CLIP embedding
+        try:
+            image = preprocess(Image.open(file_path)).unsqueeze(0).to(device)
+            with torch.no_grad():
+                image_features = clip_model.encode_image(image)
+                metadata.embedding = image_features.cpu().numpy().tolist()[0]
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Error processing image: {str(e)}")
+        
+        # Save metadata with embedding
+        self.metadata[metadata.id] = metadata
+        self._save_metadata()
+
+    def get_image(self, image_id: str) -> Optional[tuple[Path, ImageMetadata]]:
+        if image_id not in self.metadata:
+            return None
+        metadata = self.metadata[image_id]
+        image_path = self.images_dir / metadata.filename
+        if not image_path.exists():
+            return None
+        return image_path, metadata
+
+    def get_relevant_images(self, query: str, top_k: int = 1) -> List[tuple[Path, ImageMetadata]]:
+        # Encode the text query using CLIP
+        text_tokens = open_clip.tokenize([query]).to(device)
+        with torch.no_grad():
+            text_features = clip_model.encode_text(text_tokens)
+            text_features = text_features.cpu().numpy()[0]
+
+        # Calculate similarities with all images
+        image_scores = []
+        for metadata in self.metadata.values():
+            if metadata.embedding is None:
+                continue
+            similarity = cosine_similarity([text_features], [metadata.embedding])[0][0]
+            image_scores.append((metadata, similarity))
+        
+        # Sort by similarity score and get top k
+        image_scores.sort(key=lambda x: x[1], reverse=True)
+        relevant_images = []
+        
+        for metadata, score in image_scores[:top_k]:
+            image_path = self.images_dir / metadata.filename
+            if image_path.exists():
+                relevant_images.append((image_path, metadata))
+        
+        return relevant_images
+
+    def get_image_by_filename(self, filename: str) -> Optional[tuple[Path, ImageMetadata]]:
+        """Get image by filename"""
+        image_path = self.images_dir / filename
+        if not image_path.exists():
+            return None
+        # Find metadata by filename
+        for metadata in self.metadata.values():
+            if metadata.filename == filename:
+                return image_path, metadata
+        return None
+
+# Initialize image store
+image_store = ImageStore()
 
 # Initialize Pinecone client
 pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
@@ -41,14 +172,16 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000"],  # Frontend URL
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],  # Explicitly list allowed methods
     allow_headers=["*"],
+    expose_headers=["*"]
 )
 
 
 class QueryRequest(BaseModel):
     question: str
     top_k: int = 30
+    include_images: bool = True
 
 def clean_text(text: str) -> str:
     text = re.sub(r'[^\x00-\x7F]+', ' ', text)
@@ -110,12 +243,13 @@ def upsert_chunks(chunks: List[dict], source_id: str, batch_size=50):
 
 
 
-def hybrid_search(query: str, top_k=5) -> List[dict]:
+def hybrid_search(query: str, top_z=1) -> List[dict]:
     # 1. Embed the query
+    top_k=1
     embedding = get_embedding(query)
 
     # 2. Initial dense search
-    results = index.query(vector=embedding, top_k=top_k * 5, include_metadata=True)
+    results = index.query(vector=embedding, top_k=top_k , include_metadata=True)
 
     # 3. Define keyword match score
     def keyword_score(text: str, query: str):
@@ -209,27 +343,62 @@ def upload_pdf(file: UploadFile, source_id: str = Form(...)):
     upsert_chunks(all_chunks, source_id)
     return {"message": f"PDF '{source_id}' processed and stored."}
 
-@app.post("/query/")
-def query_docs(req: QueryRequest):
+@app.post("/upload_image/")
+async def upload_image(
+    file: UploadFile,
+    image_id: str = Form(...)
+):
+    metadata = ImageMetadata(
+        id=image_id,
+        filename=file.filename
+    )
+    image_store.add_image(file, metadata)
+    return {"message": f"Image '{image_id}' uploaded successfully"}
+
+@app.get("/images/{filename}")
+async def get_image(filename: str):
+    result = image_store.get_image_by_filename(filename)
+    if not result:
+        raise HTTPException(status_code=404, detail="Image not found")
+    image_path, metadata = result
+    return FileResponse(image_path, media_type="image/jpeg")
+
+@app.post("/query_docs/")
+async def query_docs(req: QueryRequest):
     chunks = hybrid_search(req.question, req.top_k)
-    # Extract just the chunk text from each dictionary
     context = "\n\n".join(chunk["chunk"] for chunk in chunks)
-    print("contextzz: "+context)
+    
+    # Get relevant images if requested
+    relevant_images = []
+    if req.include_images:
+        relevant_images = image_store.get_relevant_images(req.question)
+    
+    # Prepare context with image information
+    image_context = ""
+    if relevant_images:
+        image_context = "\nRelevant images:\n" + "\n".join(
+            f"- {metadata.filename}"
+            for _, metadata in relevant_images
+        )
+
     prompt = f"""Answer the question based on the following context:
 
 {context}
+{image_context}
 
 Question: {req.question}
 Answer:"""
 
-    response = openai.ChatCompletion.create(
-        model="gpt-3.5-turbo",
-        messages=[
-            {"role": "system", "content": "You are a helpful assistant that answers questions based on the provided context."},
-            {"role": "user", "content": prompt}
-        ]
-    )
+    # Use Gemini for response (model is already initialized as Gemini)
+    response = model.generate_content(prompt)
+    
     return {
         "chunks": chunks,
-        "answer": response['choices'][0]['message']['content']
+        "answer": response.text,
+        "relevant_images": [
+            {
+                "filename": metadata.filename
+            }
+            for _, metadata in relevant_images
+        ] if req.include_images else []
     }
