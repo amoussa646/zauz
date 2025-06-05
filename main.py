@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from PyPDF2 import PdfReader
 from pydantic import BaseModel
+import requests
 import torch
 from PIL import Image
 import open_clip
@@ -19,6 +20,8 @@ import numpy as np
 import json
 from pathlib import Path
 import google.generativeai as genai
+from google.generativeai.types import Tool
+from google.generativeai.types.generation_types import GenerationConfig
 load_dotenv()
 import nltk
 from nltk.tokenize import sent_tokenize
@@ -26,11 +29,13 @@ from sklearn.metrics.pairwise import cosine_similarity
 
 # nltk.download('punkt')  #
 openai.api_key = os.getenv("OPENAI_API_KEY")
-
 # Initialize Gemini
+GOOGLE_API_KEY=os.getenv("GOOGLE_CLOUD_KEY")
+GOOGLE_CSE_ID=os.getenv("GOOGLE_CSE_ID")
 genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
-model = genai.GenerativeModel('gemini-2.0-flash-001')
-
+model = genai.GenerativeModel(
+    model_name='gemini-2.0-flash-001'  # Removed tools configuration
+)
 # Image handling
 IMAGES_DIR = Path("images")
 IMAGES_METADATA_FILE = IMAGES_DIR / "metadata.json"
@@ -245,7 +250,7 @@ def upsert_chunks(chunks: List[dict], source_id: str, batch_size=50):
 
 def hybrid_search(query: str, top_z=1) -> List[dict]:
     # 1. Embed the query
-    top_k=1
+    top_k=3
     embedding = get_embedding(query)
 
     # 2. Initial dense search
@@ -293,23 +298,23 @@ def hybrid_search(query: str, top_z=1) -> List[dict]:
     enriched = []
     for r in top_results:
         meta = r["metadata"]
-        src = meta["source"]
         pg = meta["page"]
         idx = meta["index_in_page"]
-
-        page_chunks = source_chunks_map[src]
+        src = meta["source"]
+        hybrid_score = 0.6 * r["score"] + 0.4 * keyword_score(meta["text"], query)
 
         enriched.append({
-            "chunk": meta["text"],
-            "page": pg,
-            "source": src,
-            "previous": page_chunks.get((pg, idx - 1), {}).get("text"),
-            "next": page_chunks.get((pg, idx + 1), {}).get("text")
-        })
+        "chunk": meta["text"],
+        "page": pg,
+        "source": src,
+        "score": hybrid_score,  # <-- Add this line
+        "previous": source_chunks_map[src].get((pg, idx - 1), {}).get("text"),
+        "next": source_chunks_map[src].get((pg, idx + 1), {}).get("text")
+    })
 
     # 7. Optional: print results nicely
     for i, item in enumerate(enriched, 1):
-        print(f"{i}. Page {item['page']} | Source: {item['source']}")
+        print(f"{i}. Page {item['page']} | Source: {item['source']} | Score: {item['score']}")
         if item["previous"]:
             print(f"   Previous: {item['previous']}\n")
         print(f"   Chunk: {item['chunk']}\n")
@@ -363,17 +368,50 @@ async def get_image(filename: str):
     image_path, metadata = result
     return FileResponse(image_path, media_type="image/jpeg")
 
+
+
+
+class QueryRequest(BaseModel):
+    question: str
+    top_k: Optional[int] = 3
+    include_images: Optional[bool] = False
+
+def perform_google_search(query: str, api_key: str, cx: str, num_results=3) -> str:
+    search_url = "https://www.googleapis.com/customsearch/v1"
+    params = {
+        "key": api_key,
+        "cx": cx,
+        "q": query,
+        "num": num_results,
+    }
+    response = requests.get(search_url, params=params)
+    response.raise_for_status()
+    results = response.json()
+
+    snippets = []
+    for item in results.get("items", []):
+        title = item.get("title", "")
+        snippet = item.get("snippet", "")
+        link = item.get("link", "")
+        snippets.append(f"{title}\n{snippet}\n{link}")
+
+    return "\n\n".join(snippets)
 @app.post("/query_docs/")
 async def query_docs(req: QueryRequest):
+    # First try RAG search
     chunks = hybrid_search(req.question, req.top_k)
-    context = "\n\n".join(chunk["chunk"] for chunk in chunks)
-    
-    # Get relevant images if requested
+
+# Filter chunks based on a minimum hybrid relevance score
+    MIN_SCORE_THRESHOLD = 0.9  # tune this threshold
+    relevant_chunks = [c for c in chunks if c.get("score", 0) >= MIN_SCORE_THRESHOLD]
+
+   
+    # Get relevant images using CLIP (do this regardless of text search result)
     relevant_images = []
     if req.include_images:
-        relevant_images = image_store.get_relevant_images(req.question)
+        relevant_images = image_store.get_relevant_images(req.question, top_k=1)  # Increased to 2 images
     
-    # Prepare context with image information
+    # Prepare image context
     image_context = ""
     if relevant_images:
         image_context = "\nRelevant images:\n" + "\n".join(
@@ -381,24 +419,45 @@ async def query_docs(req: QueryRequest):
             for _, metadata in relevant_images
         )
 
-    prompt = f"""Answer the question based on the following context:
+    # If we have relevant chunks, use them for the answer
+    if relevant_chunks:  
+        context = "\n\n".join(chunk["chunk"] for chunk in chunks)
+        prompt = f"""Answer the question based on the following context:
 
 {context}
 {image_context}
-
+if the context does not contain relative information then perform google search
 Question: {req.question}
 Answer:"""
-
-    # Use Gemini for response (model is already initialized as Gemini)
-    response = model.generate_content(prompt)
+        response = model.generate_content(prompt)
+        answer = response.text if hasattr(response, 'text') else str(response)
+    else:
+        # Fallback to direct question
+        prompt = f"answer the following question in a summerize way in form of regular sentences : Question: {req.question}\nAnswer:"
+        response = model.generate_content(prompt)
+        try:
+            if hasattr(response, 'text'):
+                answer = response.text
+            elif hasattr(response, 'candidates') and response.candidates:
+                candidate = response.candidates[0]
+                if hasattr(candidate, 'content') and candidate.content.parts:
+                    answer = candidate.content.parts[0].text
+                else:
+                    answer = str(response)
+            else:
+                answer = str(response)
+        except Exception as e:
+            print(f"Error processing response: {e}")
+            answer = "I apologize, but I encountered an error processing the response."
     
     return {
-        "chunks": chunks,
-        "answer": response.text,
+        "chunks": chunks,  # Will be empty if no relevant chunks found
+        "answer": answer,
         "relevant_images": [
             {
                 "filename": metadata.filename
             }
             for _, metadata in relevant_images
-        ] if req.include_images else []
+        ] if req.include_images else [],
+        "source": "rag" if chunks else "web"  # Indicate the source of the answer
     }
