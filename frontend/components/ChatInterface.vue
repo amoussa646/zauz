@@ -80,13 +80,17 @@
     <!-- Input Form -->
     <div class="bg-white border-t p-4">
       <div class="max-w-4xl mx-auto">
-        <form @submit.prevent="handleSubmit" class="flex gap-2">
+        <form @submit.prevent="handleSubmit" class="flex gap-2 items-center">
           <input
             v-model="message"
             type="text"
             placeholder="Ask a question..."
             class="flex-1 p-2 border rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
             :disabled="store.loading"
+          />
+          <VoiceQuery
+            @query-response="handleVoiceResponse"
+            class="mx-2"
           />
           <button
             type="submit"
@@ -148,6 +152,7 @@
 <script setup lang="ts">
 import { ref } from 'vue'
 import { useChatStore } from '~/stores/chat'
+import VoiceQuery from './VoiceQuery.vue'
 
 const store = useChatStore()
 const message = ref('')
@@ -228,10 +233,69 @@ const formatMessage = (content: string) => {
     .replace(/>/g, '&gt;')
     .replace(/\n/g, '<br>')
 }
+
+const handleVoiceResponse = (response: any) => {
+  if (response.error) {
+    // Handle error if needed
+    console.error('Voice query error:', response.error)
+    return
+  }
+  
+  // Add the voice query response to the chat
+  store.messages.push({
+    type: 'user',
+    content: response.transcript || 'Voice query',
+    timestamp: new Date().toISOString()
+  })
+  
+  store.messages.push({
+    type: 'assistant',
+    content: response.answer,
+    timestamp: new Date().toISOString(),
+    chunks: response.chunks,
+    relevantImages: response.relevant_images
+  })
+  
+  // Scroll to bottom
+  store.$nextTick(() => {
+    const chatContainer = document.querySelector('.overflow-y-auto')
+    if (chatContainer) {
+      chatContainer.scrollTop = chatContainer.scrollHeight
+    }
+  })
+}
 </script>
 
 <style scoped>
 .prose {
   max-width: none;
+}
+
+.input-wrapper {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  width: 100%;
+}
+
+.voice-query-wrapper {
+  flex-shrink: 0;
+}
+
+/* Update existing styles to accommodate voice query */
+.input-container {
+  padding: 1rem;
+  background-color: #f5f5f5;
+  border-top: 1px solid #e0e0e0;
+}
+
+textarea {
+  flex-grow: 1;
+  min-height: 40px;
+  max-height: 120px;
+  padding: 0.5rem;
+  border: 1px solid #e0e0e0;
+  border-radius: 0.5rem;
+  resize: vertical;
 }
 </style> 

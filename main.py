@@ -1,7 +1,7 @@
 import os
 import re
 from typing import List, Dict, Optional
-from fastapi import FastAPI, UploadFile, Form, HTTPException
+from fastapi import FastAPI, UploadFile, Form, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from PyPDF2 import PdfReader
@@ -22,6 +22,13 @@ from pathlib import Path
 import google.generativeai as genai
 from google.generativeai.types import Tool
 from google.generativeai.types.generation_types import GenerationConfig
+import asyncio
+import logging
+from livekit import rtc, api
+from livekit.rtc.room import Room
+import wave
+import io
+import speech_recognition as sr
 load_dotenv()
 import nltk
 from nltk.tokenize import sent_tokenize
@@ -182,11 +189,93 @@ app.add_middleware(
     expose_headers=["*"]
 )
 
+# LiveKit configuration
+LIVEKIT_API_KEY = os.getenv("LIVEKIT_API_KEY")
+LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET")
+LIVEKIT_URL = os.getenv("LIVEKIT_URL", "ws://localhost:7880")
+
+# Initialize LiveKit room and API
+room = None
+lkapi = None
+
+async def initialize_livekit():
+    global room, lkapi
+    try:
+        if not LIVEKIT_API_KEY or not LIVEKIT_API_SECRET:
+            raise ValueError("LIVEKIT_API_KEY and LIVEKIT_API_SECRET must be set in environment variables")
+            
+        # Initialize LiveKit API with credentials
+        api_url = LIVEKIT_URL.replace("ws://", "http://").replace("wss://", "https://")
+        lkapi = api.LiveKitAPI(
+            api_url,
+            api_key=LIVEKIT_API_KEY,
+            api_secret=LIVEKIT_API_SECRET
+        )
+        
+        # Create room if it doesn't exist
+        try:
+            await lkapi.room.create_room(
+                api.CreateRoomRequest(name="voice_room")
+            )
+        except Exception as e:
+            logging.info(f"Room might already exist: {str(e)}")
+        
+        # Generate access token
+        token = api.AccessToken(
+            api_key=LIVEKIT_API_KEY,
+            api_secret=LIVEKIT_API_SECRET
+        ).with_identity("server") \
+         .with_name("Server") \
+         .with_grants(api.VideoGrants(
+            room_join=True,
+            room="voice_room"
+        )).to_jwt()
+        
+        # Initialize and connect room
+        room = Room()
+        
+        # Set up event handlers
+        @room.on("participant_connected")
+        def on_participant_connected(participant: rtc.RemoteParticipant):
+            logging.info(f"Participant connected: {participant.sid} {participant.identity}")
+        
+        @room.on("track_subscribed")
+        def on_track_subscribed(track: rtc.Track, publication: rtc.RemoteTrackPublication, participant: rtc.RemoteParticipant):
+            logging.info(f"Track subscribed: {publication.sid}")
+            if track.kind == rtc.TrackKind.KIND_AUDIO:
+                # Handle audio track subscription
+                logging.info(f"Audio track subscribed from {participant.identity}")
+        
+        # Connect to room
+        await room.connect(LIVEKIT_URL, token)
+        logging.info(f"Connected to room {room.name}")
+        
+        return room
+    except Exception as e:
+        logging.error(f"Error initializing LiveKit: {str(e)}")
+        raise
+
+# Create startup event handler
+@app.on_event("startup")
+async def startup_event():
+    await initialize_livekit()
+
+# Create shutdown event handler
+@app.on_event("shutdown")
+async def shutdown_event():
+    global lkapi
+    if lkapi:
+        await lkapi.aclose()
 
 class QueryRequest(BaseModel):
     question: str
     top_k: int = 30
     include_images: bool = True
+
+class VoiceQueryRequest(BaseModel):
+    audio_data: bytes
+    sample_rate: int = 16000
+    sample_width: int = 2
 
 def clean_text(text: str) -> str:
     text = re.sub(r'[^\x00-\x7F]+', ' ', text)
@@ -250,7 +339,7 @@ def upsert_chunks(chunks: List[dict], source_id: str, batch_size=50):
 
 def hybrid_search(query: str, top_z=1) -> List[dict]:
     # 1. Embed the query
-    top_k=3
+    top_k=80
     embedding = get_embedding(query)
 
     # 2. Initial dense search
@@ -368,48 +457,19 @@ async def get_image(filename: str):
     image_path, metadata = result
     return FileResponse(image_path, media_type="image/jpeg")
 
-
-
-
-class QueryRequest(BaseModel):
-    question: str
-    top_k: Optional[int] = 3
-    include_images: Optional[bool] = False
-
-def perform_google_search(query: str, api_key: str, cx: str, num_results=3) -> str:
-    search_url = "https://www.googleapis.com/customsearch/v1"
-    params = {
-        "key": api_key,
-        "cx": cx,
-        "q": query,
-        "num": num_results,
-    }
-    response = requests.get(search_url, params=params)
-    response.raise_for_status()
-    results = response.json()
-
-    snippets = []
-    for item in results.get("items", []):
-        title = item.get("title", "")
-        snippet = item.get("snippet", "")
-        link = item.get("link", "")
-        snippets.append(f"{title}\n{snippet}\n{link}")
-
-    return "\n\n".join(snippets)
 @app.post("/query_docs/")
 async def query_docs(req: QueryRequest):
     # First try RAG search
     chunks = hybrid_search(req.question, req.top_k)
 
-# Filter chunks based on a minimum hybrid relevance score
+    # Filter chunks based on a minimum hybrid relevance score
     MIN_SCORE_THRESHOLD = 0.9  # tune this threshold
     relevant_chunks = [c for c in chunks if c.get("score", 0) >= MIN_SCORE_THRESHOLD]
 
-   
     # Get relevant images using CLIP (do this regardless of text search result)
     relevant_images = []
     if req.include_images:
-        relevant_images = image_store.get_relevant_images(req.question, top_k=1)  # Increased to 2 images
+        relevant_images = image_store.get_relevant_images(req.question, top_k=1)
     
     # Prepare image context
     image_context = ""
@@ -421,7 +481,8 @@ async def query_docs(req: QueryRequest):
 
     # If we have relevant chunks, use them for the answer
     if relevant_chunks:  
-        context = "\n\n".join(chunk["chunk"] for chunk in chunks)
+        # Only use the first chunk
+        context = relevant_chunks[0]["chunk"]
         prompt = f"""Answer the question based on the following context:
 
 {context}
@@ -451,7 +512,7 @@ Answer:"""
             answer = "I apologize, but I encountered an error processing the response."
     
     return {
-        "chunks": chunks,  # Will be empty if no relevant chunks found
+        "chunks": [relevant_chunks[0]] if relevant_chunks else [],  # Only return the first chunk
         "answer": answer,
         "relevant_images": [
             {
@@ -459,5 +520,71 @@ Answer:"""
             }
             for _, metadata in relevant_images
         ] if req.include_images else [],
-        "source": "rag" if chunks else "web"  # Indicate the source of the answer
+        "source": "rag" if relevant_chunks else "web"  # Indicate the source of the answer
     }
+
+@app.websocket("/ws/voice")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    recognizer = sr.Recognizer()
+    
+    try:
+        while True:
+            # Receive audio data
+            data = await websocket.receive_bytes()
+            
+            # Convert bytes to audio file
+            audio_io = io.BytesIO(data)
+            with wave.open(audio_io, 'rb') as wav_file:
+                # Read audio data
+                audio_data = wav_file.readframes(wav_file.getnframes())
+                
+                # Convert to AudioData for speech recognition
+                audio = sr.AudioData(
+                    audio_data,
+                    sample_rate=wav_file.getframerate(),
+                    sample_width=wav_file.getsampwidth()
+                )
+                
+                try:
+                    # Perform speech recognition
+                    text = recognizer.recognize_google(audio)
+                    
+                    # Process the query using existing query_docs endpoint
+                    query_request = QueryRequest(question=text)
+                    response = await query_docs(query_request)
+                    
+                    # Add the transcript to the response
+                    response["transcript"] = text
+                    
+                    # Send back the response
+                    await websocket.send_json(response)
+                    
+                except sr.UnknownValueError:
+                    await websocket.send_json({
+                        "error": "Could not understand audio",
+                        "answer": "I'm sorry, I couldn't understand what you said. Could you please try again?",
+                        "transcript": ""
+                    })
+                except sr.RequestError as e:
+                    await websocket.send_json({
+                        "error": f"Could not request results; {str(e)}",
+                        "answer": "I'm sorry, there was an error processing your voice input. Please try again.",
+                        "transcript": ""
+                    })
+                    
+    except WebSocketDisconnect:
+        print("Client disconnected")
+    except Exception as e:
+        print(f"Error in websocket: {str(e)}")
+        await websocket.close()
+
+# Add CORS middleware to allow WebSocket connections
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["*"]
+)
